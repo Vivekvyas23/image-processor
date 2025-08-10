@@ -1,70 +1,97 @@
 import streamlit as st
-from PIL import Image
-import numpy as np
 import cv2
+import numpy as np
+from PIL import Image
 from rembg import remove
 import io
+import sys
 
-# --- IMAGE PROCESSING FUNCTIONS ---
-def remove_bg(image):
-    return Image.open(io.BytesIO(remove(image))).convert("RGBA")
+# ---------- FUNCTIONS ----------
+@st.cache_resource
+def load_rembg():
+    print("Loading rembg model...", file=sys.stderr)
+    return remove  # caching function so it’s not reloaded every time
 
 def enhance_features(image):
-    if image.mode != "RGBA":
-        image = image.convert("RGBA")
-    img_np = np.array(image)
-    rgb, alpha = img_np[:, :, :3], img_np[:, :, 3]
+    rgb = np.array(image.convert("RGB"))
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
     l, a, b = cv2.split(lab)
-    cl = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l)
-    enhanced_rgb = cv2.cvtColor(cv2.merge([cl, a, b]), cv2.COLOR_LAB2RGB)
-    blurred = cv2.GaussianBlur(enhanced_rgb, (0, 0), 3)
-    sharpened = cv2.addWeighted(enhanced_rgb, 1.5, blurred, -0.5, 0)
-    return Image.fromarray(np.dstack((sharpened, alpha)), "RGBA")
 
-def add_solid_bg(image, color):
-    bg = Image.new("RGBA", image.size, color+(255,))
-    return Image.alpha_composite(bg, image).convert("RGB")
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    limg = cv2.merge([cl, a, b])
 
-# --- STREAMLIT UI ---
-st.set_page_config(page_title="Image Processing Tool", layout="centered")
-st.title("🖼 Image Processing Tool")
+    enhanced_rgb = cv2.cvtColor(limg, cv2.COLOR_LAB2RGB)
 
-uploaded = st.file_uploader("Upload an Image", type=["png", "jpg", "jpeg"])
+    enhanced_rgb_float = enhanced_rgb.astype(np.float32) / 255.0
+    blurred = cv2.GaussianBlur(enhanced_rgb_float, (0, 0), 3)
+    unsharp_mask = enhanced_rgb_float - blurred
+    sharpened_rgb_float = enhanced_rgb_float + unsharp_mask * 1.0
+    sharpened_rgb_float = np.clip(sharpened_rgb_float, 0, 1)
+    sharpened_rgb = (sharpened_rgb_float * 255).astype(np.uint8)
 
-if uploaded:
-    img = Image.open(uploaded)
-    st.image(img, caption="Original Image", use_container_width=True)
+    return Image.fromarray(sharpened_rgb)
 
-    st.subheader("Select Operations")
-    remove_bg_option = st.checkbox("Remove Background")
-    add_bg_option = st.checkbox("Add Solid Background Color")
-    enhance_option = st.checkbox("Enhance Features")
-    resize_option = st.checkbox("Resize Image")
+def add_solid_background(image, color):
+    if image.mode != "RGBA":
+        image = image.convert("RGBA")
+    bg = Image.new("RGBA", image.size, color)
+    return Image.alpha_composite(bg, image)
 
-    bg_color = (255, 255, 255)
-    if add_bg_option:
-        bg_color_hex = st.color_picker("Pick Background Color", "#FFFFFF")
-        bg_color = tuple(int(bg_color_hex.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
+# ---------- STREAMLIT UI ----------
+st.set_page_config(page_title="Image Processor", layout="wide")
+st.title("🖼 Image Background Remover & Enhancer")
 
-    new_size = None
-    if resize_option:
-        width = st.number_input("Width", value=800)
-        height = st.number_input("Height", value=600)
-        new_size = (width, height)
+uploaded_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
 
-    if st.button("🚀 Process Image"):
-        result = img
-        if remove_bg_option:
-            result = remove_bg(result)
-            if add_bg_option:
-                result = add_solid_bg(result, bg_color)
-        if enhance_option:
-            result = enhance_features(result)
-        if resize_option and new_size:
-            result = result.resize(new_size, Image.LANCZOS)
+if uploaded_file:
+    image = Image.open(uploaded_file).convert("RGBA")
+    st.image(image, caption="📷 Original Image", use_column_width=True)
 
-        st.image(result, caption="Processed Image", use_container_width=True)
-        buf = io.BytesIO()
-        result.save(buf, format="PNG")
-        st.download_button("⬇ Download Image", buf.getvalue(), "processed.png", "image/png")
+    st.write("---")
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        remove_bg = st.checkbox("Remove Background", value=True)
+        enhance = st.checkbox("Enhance Features", value=False)
+
+    with col2:
+        bg_color = st.color_picker("Background Color", "#FFFFFF")
+        apply_bg = st.checkbox("Apply Solid Background", value=False)
+
+    with col3:
+        download_ready = False
+        process_btn = st.button("🚀 Process Image")
+
+    if process_btn:
+        try:
+            processed_img = image
+            if remove_bg:
+                st.write("Removing background...")
+                rembg_func = load_rembg()
+                processed_img = Image.open(io.BytesIO(rembg_func(np.array(processed_img))))
+
+            if enhance:
+                st.write("Enhancing image...")
+                processed_img = enhance_features(processed_img)
+
+            if apply_bg:
+                st.write("Adding solid background...")
+                processed_img = add_solid_background(processed_img, bg_color)
+
+            st.image(processed_img, caption="✅ Processed Image", use_column_width=True)
+
+            buf = io.BytesIO()
+            processed_img.save(buf, format="PNG")
+            byte_im = buf.getvalue()
+
+            st.download_button(
+                label="📥 Download Image",
+                data=byte_im,
+                file_name="processed_image.png",
+                mime="image/png"
+            )
+
+        except Exception as e:
+            st.error(f"❌ Error during processing: {e}")
+            print(f"Error: {e}", file=sys.stderr)
