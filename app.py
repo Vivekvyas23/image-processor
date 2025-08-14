@@ -1,291 +1,206 @@
-# app.py
 import streamlit as st
-from PIL import Image, ImageOps
+from PIL import Image, ImageEnhance
 import numpy as np
 import cv2
 import io
-import sys
-from typing import Tuple
+from rembg import remove
 
-st.set_page_config(page_title="Advanced Image Processing Tool", layout="centered")
+st.set_page_config(page_title="🎨 Image Processing Tool", layout="wide")
+st.title("🖼️ Advanced Image Processing Tool")
 
-# ----------------- Helpers & cached resources -----------------
-@st.cache_resource
-def load_face_cascade():
-    # Haar cascade (fast, no extra deps)
-    return cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+# ================== Globals & Quick Colors ==================
+quick_colors = {
+    "White": (255,255,255),
+    "Black": (0,0,0),
+    "Blue": (0,0,255),
+    "Green": (0,255,0)
+}
 
-@st.cache_resource
-def load_rembg_if_available():
-    # lazy import rembg (may not be installed in some hosts)
-    try:
-        from rembg import remove as rembg_remove
-        print("rembg available", file=sys.stderr)
-        return rembg_remove
-    except Exception as e:
-        print("rembg not available:", e, file=sys.stderr)
-        return None
+def hex_color(rgb):
+    return '#{:02x}{:02x}{:02x}'.format(*rgb)
 
-face_cascade = load_face_cascade()
-rembg_remove = load_rembg_if_available()
+# ================== Image Processing Functions ==================
+def remove_background(image_bgr):
+    pil_img = Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
+    img_bytes = io.BytesIO()
+    pil_img.save(img_bytes, format='PNG')
+    output_bytes = remove(img_bytes.getvalue())  # rembg
+    return Image.open(io.BytesIO(output_bytes)).convert("RGBA")
 
-# ----------------- Image utilities -----------------
-def pil_to_np(img: Image.Image) -> np.ndarray:
-    return np.array(img)
+def add_background(image_rgba, color=(255, 255, 255)):
+    bg = Image.new("RGBA", image_rgba.size, color + (255,))
+    return Image.alpha_composite(bg, image_rgba)
 
-def np_to_pil(arr: np.ndarray) -> Image.Image:
-    if arr.dtype != np.uint8:
-        arr = arr.astype(np.uint8)
-    if arr.ndim == 2:
-        return Image.fromarray(arr)
-    return Image.fromarray(arr)
-
-def resize_for_preview(pil_img: Image.Image, max_side: int = 640) -> Image.Image:
-    w, h = pil_img.size
-    scale = min(1.0, max_side / max(w, h))
-    if scale < 1.0:
-        return pil_img.resize((int(w*scale), int(h*scale)), Image.LANCZOS)
-    return pil_img.copy()
-
-# ----------------- Background removal (fast GrabCut preview) -----------------
-def grabcut_remove(pil_img: Image.Image) -> Image.Image:
-    """Fast GrabCut-based alpha output (RGBA). Works fairly well for preview."""
-    img = pil_to_np(pil_img.convert("RGB"))
-    h, w = img.shape[:2]
-    mask = np.zeros((h, w), np.uint8)
-    bgd = np.zeros((1,65), np.float64)
-    fgd = np.zeros((1,65), np.float64)
-
-    # rect inset a little
-    rx = max(1, int(0.02 * w))
-    ry = max(1, int(0.02 * h))
-    rw = max(2, w - 2*rx)
-    rh = max(2, h - 2*ry)
-    rect = (rx, ry, rw, rh)
-
-    try:
-        cv2.grabCut(img, mask, rect, bgd, fgd, 3, cv2.GC_INIT_WITH_RECT)
-    except Exception as e:
-        print("grabCut error:", e, file=sys.stderr)
-
-    mask2 = np.where((mask==2)|(mask==0), 0, 1).astype('uint8')
-    alpha = (mask2 * 255).astype('uint8')
-    rgba = np.dstack((img, alpha))
-    return np_to_pil(rgba)
-
-def rembg_remove_highres(pil_img: Image.Image):
-    """Use rembg if available; raises if not available."""
-    if rembg_remove is None:
-        raise RuntimeError("rembg not available")
-    buf = io.BytesIO()
-    pil_img.save(buf, format="PNG")
-    out = rembg_remove(buf.getvalue())
-    return Image.open(io.BytesIO(out)).convert("RGBA")
-
-# ----------------- Face-only enhancement -----------------
-def detect_faces_np(img_rgb: np.ndarray) -> list:
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30,30))
-    return faces
-
-def make_face_mask(img_rgb: np.ndarray, faces, expand = 1.2, feather=15) -> np.ndarray:
-    """Return single-channel mask [0..255] with soft edges."""
-    h, w = img_rgb.shape[:2]
-    mask = np.zeros((h, w), dtype=np.uint8)
-    for (x,y,fw,fh) in faces:
-        cx, cy = x + fw//2, y + fh//2
-        rx = int((fw/2) * expand)
-        ry = int((fh/2) * expand)
-        cv2.ellipse(mask, (cx, cy), (rx, ry), 0, 0, 360, 255, -1)
-    if feather>0:
-        k = max(3, feather//2*2+1)
-        mask = cv2.GaussianBlur(mask, (k,k), feather)
-    return mask
-
-def enhance_face_region(pil_img: Image.Image, clip_limit: float, sharpness: float, preview: bool=False) -> Image.Image:
-    """Apply CLAHE and unsharp only inside face mask. preview=True expects small image."""
-    # work on RGB array
-    img_rgb = pil_to_np(pil_img.convert("RGB"))
-    faces = detect_faces_np(img_rgb)
-    if len(faces) == 0:
-        # nothing to do
-        return pil_img
-
-    mask = make_face_mask(img_rgb, faces, expand=1.25, feather=25 if not preview else 11)
-    mask_norm = mask.astype(np.float32)/255.0
-    mask_3c = np.dstack([mask_norm]*3)
-
-    # CLAHE on L channel
-    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
-    l,a,b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8,8))
-    l_enh = clahe.apply(l)
-    lab_enh = cv2.merge([l_enh, a, b])
-    rgb_enh = cv2.cvtColor(lab_enh, cv2.COLOR_LAB2RGB)
-
-    # unsharp
-    rgb_enh_f = rgb_enh.astype(np.float32)/255.0
-    blurred = cv2.GaussianBlur(rgb_enh_f, (0,0), 3)
-    unsharp = np.clip(rgb_enh_f + (rgb_enh_f - blurred) * sharpness, 0, 1)
-    unsharp_uint8 = (unsharp*255).astype(np.uint8)
-
-    # Blend only in mask region
-    result = (img_rgb*(1-mask_3c) + unsharp_uint8*mask_3c).astype(np.uint8)
-    return np_to_pil(result)
-
-# ----------------- UI: Layout + controls -----------------
-st.markdown("<h2 style='text-align:center'>Advanced Image Processing Tool</h2>", unsafe_allow_html=True)
-
-# Main previews area: two columns
-orig_col, proc_col = st.columns([1,1])
-
-with orig_col:
-    st.markdown("**Original Image**")
-    orig_placeholder = st.empty()  # will show original
-with proc_col:
-    st.markdown("**Processed Image (Preview)**")
-    proc_placeholder = st.empty()  # will show processed preview
-
-# Controls below previews (single full-width area)
-st.markdown("---")
-st.markdown("### Controls")
-cols = st.columns([1,1,1,1])
-
-with cols[0]:
-    uploaded = st.file_uploader("Upload Image (jpg/png)", type=["jpg","jpeg","png"])
-    show_original_size = st.checkbox("Show original size", value=False)
-with cols[1]:
-    do_bg_remove = st.checkbox("Remove Background (preview uses fast GrabCut)", value=True)
-    use_rembg_final = st.checkbox("Use rembg for final (high quality)", value=True)
-with cols[2]:
-    do_enhance = st.checkbox("Enhance Face Only", value=True)
-    clip_limit = st.slider("CLAHE clip limit", min_value=1.0, max_value=5.0, value=2.0, step=0.1) if do_enhance else 2.0
-with cols[3]:
-    sharp_strength = st.slider("Sharpen strength", min_value=0.0, max_value=2.5, value=0.8, step=0.05) if do_enhance else 0.0
-
-# Additional controls row
-cols2 = st.columns([1,1,1,1])
-with cols2[0]:
-    add_bg_color = st.checkbox("Add Background Color after removal", value=False)
-with cols2[1]:
-    bg_color_hex = st.color_picker("Background Color", "#FFFFFF") if add_bg_color else "#FFFFFF"
-with cols2[2]:
-    resize_option = st.selectbox("Preview / Final Size", options=["Preview size", "Original", "800x600", "1024x768"])
-with cols2[3]:
-    apply_button = st.button("Apply (final, high-res)")
-    download_button = None
-
-# Processing pipeline (preview)
-preview_max_side = 640  # preview downscale for responsiveness
-
-if uploaded is None:
-    orig_placeholder.info("Upload an image to begin")
-    proc_placeholder.info("Processed preview will appear here")
-else:
-    # Load PIL image
-    uploaded_pil = Image.open(uploaded)
-    if not show_original_size:
-        display_orig = resize_for_preview(uploaded_pil, max_side=800)
+def _enhance_max(pil_img):
+    has_alpha = (pil_img.mode == "RGBA")
+    if has_alpha:
+        arr = np.array(pil_img)
+        alpha = arr[:, :, 3]
+        rgb = arr[:, :, :3]
     else:
-        display_orig = uploaded_pil.copy()
+        alpha = None
+        rgb = np.array(pil_img.convert("RGB"))
 
-    orig_placeholder.image(display_orig, use_column_width=True)
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    lab = cv2.merge((l, a, b))
+    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
 
-    # Build preview image (low-res, fast)
-    # Start from downscaled copy
-    preview_input = resize_for_preview(uploaded_pil, max_side=preview_max_side)
+    blurred = cv2.GaussianBlur(enhanced, (0, 0), sigmaX=1.6, sigmaY=1.6)
+    sharp = cv2.addWeighted(enhanced, 1.6, blurred, -0.6, 0)
 
-    # 1) background removal (preview fast: GrabCut)
-    if do_bg_remove:
-        try:
-            preview_removed = grabcut_remove(preview_input)
-        except Exception as e:
-            print("grabcut preview error:", e, file=sys.stderr)
-            preview_removed = preview_input.copy()
+    pil_tmp = Image.fromarray(sharp)
+    pil_tmp = ImageEnhance.Contrast(pil_tmp).enhance(1.15)
+    pil_tmp = ImageEnhance.Color(pil_tmp).enhance(1.20)
+
+    out_rgb = np.array(pil_tmp)
+    if alpha is not None:
+        out = np.dstack((out_rgb, alpha))
+        return Image.fromarray(out, mode="RGBA")
+    return pil_tmp
+
+def enhance_image_blend(pil_img, amount):
+    amount = float(max(0.0, min(1.0, amount)))
+    if amount == 0.0:
+        return pil_img.copy()
+    enhanced_max = _enhance_max(pil_img)
+    if pil_img.mode == "RGBA":
+        orig = np.array(pil_img)
+        enh  = np.array(enhanced_max)
+        alpha = orig[:, :, 3:4]
+        blended_rgb = (orig[:, :, :3].astype(np.float32) * (1.0 - amount) +
+                       enh[:, :, :3].astype(np.float32) * amount)
+        blended_rgb = np.clip(blended_rgb, 0, 255).astype(np.uint8)
+        out = np.concatenate([blended_rgb, alpha], axis=2)
+        return Image.fromarray(out, mode="RGBA")
     else:
-        preview_removed = preview_input.copy()
+        orig = np.array(pil_img.convert("RGB"))
+        enh  = np.array(enhanced_max.convert("RGB"))
+        blended_rgb = (orig.astype(np.float32) * (1.0 - amount) +
+                       enh.astype(np.float32)  * amount)
+        blended_rgb = np.clip(blended_rgb, 0, 255).astype(np.uint8)
+        return Image.fromarray(blended_rgb, mode="RGB")
 
-    # 2) if add_bg_color and removal done, composite background for preview
-    if do_bg_remove and add_bg_color:
-        # color hex -> RGBA tuple
-        hexc = bg_color_hex.lstrip('#')
-        r,g,b = tuple(int(hexc[i:i+2],16) for i in (0,2,4))
-        bg = Image.new("RGBA", preview_removed.size, (r,g,b,255))
-        if preview_removed.mode != "RGBA":
-            preview_removed = preview_removed.convert("RGBA")
-        preview_removed = Image.alpha_composite(bg, preview_removed).convert("RGB")
-    else:
-        preview_removed = preview_removed.convert("RGB")
+def expand_bbox(x, y, w, h, img_width, img_height, expand_ratio=0.4):
+    # Expand bbox by expand_ratio (e.g., 0.4 means 40% larger in all directions)
+    x_exp = int(x - w * expand_ratio / 2)
+    y_exp = int(y - h * expand_ratio / 2)
+    w_exp = int(w * (1 + expand_ratio))
+    h_exp = int(h * (1 + expand_ratio))
+    # Clamp to image boundaries
+    x_exp = max(0, x_exp)
+    y_exp = max(0, y_exp)
+    w_exp = min(img_width - x_exp, w_exp)
+    h_exp = min(img_height - y_exp, h_exp)
+    return x_exp, y_exp, w_exp, h_exp
 
-    # 3) face-only enhancement on preview (fast low-res)
-    if do_enhance:
-        try:
-            preview_processed = enhance_face_region(preview_removed, clip_limit, sharp_strength, preview=True)
-        except Exception as e:
-            print("preview enhance error:", e, file=sys.stderr)
-            preview_processed = preview_removed
-    else:
-        preview_processed = preview_removed
+def enhance_faces_only(pil_img, amount, cascade_path="haarcascade_frontalface_default.xml"):
+    img_cv = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+    face_cascade = cv2.CascadeClassifier(cascade_path)
+    if face_cascade.empty():
+        st.error("Could not load Haar Cascade XML file for face detection. Please ensure 'haarcascade_frontalface_default.xml' is in the project folder.")
+        return pil_img, []
+    faces = face_cascade.detectMultiScale(
+        gray, 
+        scaleFactor=1.1, 
+        minNeighbors=3,   # More sensitive
+        minSize=(30, 30)  # Detect smaller faces
+    )
+    img_out = pil_img.copy()
+    img_width, img_height = pil_img.size
+    expanded_faces = []
+    for (x, y, w, h) in faces:
+        x_exp, y_exp, w_exp, h_exp = expand_bbox(x, y, w, h, img_width, img_height, expand_ratio=0.4)
+        face_crop = pil_img.crop((x_exp, y_exp, x_exp+w_exp, y_exp+h_exp))
+        enhanced_face = enhance_image_blend(face_crop, amount)
+        img_out.paste(enhanced_face, (x_exp, y_exp))
+        expanded_faces.append((x_exp, y_exp, w_exp, h_exp))
+    return img_out, expanded_faces
 
-    # Show preview
-    proc_placeholder.image(preview_processed, use_column_width=True)
+# ================== Streamlit UI ==================
+st.sidebar.header("Controls")
+uploaded_file = st.sidebar.file_uploader("📂 Upload Image", type=["png", "jpg", "jpeg"])
+remove_bg = st.sidebar.checkbox("Remove Background")
+add_bg = st.sidebar.checkbox("Add Background Color")
+resize_img = st.sidebar.checkbox("Resize Image")
+enhance_img = st.sidebar.checkbox("Enhance Image")
+face_only = st.sidebar.checkbox("Enhance Only Face Region")
 
-    # If user clicks Apply (final high-res): run final pipeline (may use rembg)
-    if apply_button:
-        st.info("Running final high-quality processing — this may take a few seconds.")
-        # operate on original uploaded_pil (full resolution)
-        final_img = uploaded_pil.convert("RGBA")
+st.sidebar.markdown("**Background Color**")
+color_option = st.sidebar.selectbox("Quick Colors", list(quick_colors.keys()))
+selected_color = quick_colors[color_option]
+custom_color = st.sidebar.color_picker("Or pick custom", hex_color(selected_color))
+if custom_color:
+    selected_color = tuple(int(custom_color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
 
-        # 1) high-quality background removal if requested
-        if do_bg_remove:
-            # If rembg available and user wants it, use it; otherwise use GrabCut high-res
-            if use_rembg_final and rembg_remove is not None:
-                try:
-                    final_img = rembg_remove_highres = rembg_remove(io.BytesIO(final_img.tobytes()) if False else None)  # placeholder
-                    # We must call rembg_remove with bytes; simpler to use helper:
-                except Exception as e:
-                    # fallback to helper wrapper below
-                    print("rembg direct usage placeholder", file=sys.stderr)
-                # use wrapper function defined earlier to safely call rembg
-                try:
-                    final_img = rembg_remove_highres = rembg_remove_helper(uploaded_pil)
-                except Exception as e:
-                    print("rembg failed, falling back to GrabCut:", e, file=sys.stderr)
-                    final_img = grabcut_remove(uploaded_pil).convert("RGBA")
-            else:
-                final_img = grabcut_remove(uploaded_pil).convert("RGBA")
+resize_presets = ["800x600","1024x768","640x480","Custom"]
+resize_choice = st.sidebar.selectbox("Resize Preset", resize_presets)
+custom_w = st.sidebar.number_input("Custom Width", min_value=1, value=800) if resize_choice == "Custom" else None
+custom_h = st.sidebar.number_input("Custom Height", min_value=1, value=600) if resize_choice == "Custom" else None
 
-        # 2) add bg color if requested
-        if do_bg_remove and add_bg_color:
-            hexc = bg_color_hex.lstrip('#')
-            r,g,b = tuple(int(hexc[i:i+2],16) for i in (0,2,4))
-            bg = Image.new("RGBA", final_img.size, (r,g,b,255))
-            final_img = Image.alpha_composite(bg, final_img).convert("RGB")
+# Show appropriate slider
+enhance_strength = 0
+face_enhance_strength = 0
+if enhance_img and not face_only:
+    enhance_strength = st.sidebar.slider("Enhancement Strength (Whole Image)", 0, 100, 0)
+if face_only:
+    face_enhance_strength = st.sidebar.slider("Enhancement Strength (Face Only)", 0, 100, 0)
+
+original_pil = None
+processed_img = None
+
+if uploaded_file:
+    original_pil = Image.open(uploaded_file).convert("RGBA")
+    img = original_pil.copy()
+
+    # Background removal
+    if remove_bg:
+        img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGBA2BGR)
+        img = remove_background(img_cv)
+
+    # Add solid background
+    if add_bg:
+        img = add_background(img, selected_color)
+
+    # Resize
+    if resize_img:
+        if resize_choice == "Custom":
+            w, h = custom_w, custom_h
         else:
-            # if no background removal but still want bg color? ignore
-            if final_img.mode == "RGBA":
-                final_img = final_img.convert("RGB")
+            w, h = map(int, resize_choice.split("x"))
+        img = img.resize((w, h), Image.LANCZOS)
 
-        # 3) final face enhancement (full-res)
-        if do_enhance:
-            try:
-                final_img = enhance_face_region(final_img, clip_limit, sharp_strength, preview=False)
-            except Exception as e:
-                print("final enhance error:", e, file=sys.stderr)
+    # Enhancement
+    if enhance_img and not face_only:
+        amt = enhance_strength / 100.0
+        img = enhance_image_blend(img, amount=amt)
+    elif face_only:
+        amt = face_enhance_strength / 100.0
+        cascade_path = "haarcascade_frontalface_default.xml"
+        img_rgb = img.convert("RGB")
+        img_enh, faces = enhance_faces_only(img_rgb, amt, cascade_path)
+        img = img_enh.convert("RGBA")
 
-        # 4) final resize if requested
-        if resize_option != "Preview size" and resize_option != "Original":
-            w,h = map(int, resize_option.split("x"))
-            final_img = final_img.resize((w,h), Image.LANCZOS)
+    processed_img = img
 
-        # Show final
-        st.subheader("Final Result")
-        st.image(final_img, use_column_width=True)
+    # Show images side by side with fixed width
+    col1, col2 = st.columns(2)
+    with col1:
+        st.image(original_pil, caption="Original Image", width=300)
+    with col2:
+        st.image(processed_img, caption="Processed Image", width=300)
 
-        # Download button
-        buf = io.BytesIO()
-        final_img.save(buf, format="PNG")
-        byte_im = buf.getvalue()
-        st.download_button("Download final PNG", data=byte_im, file_name="processed_final.png", mime="image/png")
-
-# ----------------- End -----------------
+    # Download button
+    buf = io.BytesIO()
+    processed_img.save(buf, format="PNG")
+    st.download_button(
+        label="Download Processed Image",
+        data=buf.getvalue(),
+        file_name="processed_image.png",
+        mime="image/png"
+    )
+else:
+    st.info("Upload an image to get started.")
